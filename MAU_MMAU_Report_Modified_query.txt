@@ -1,0 +1,180 @@
+with 
+    all_cust   --- To get the total registered customer till the cut off date
+    AS( 
+        SELECT count(distinct cust_id) Total_registered_users
+        from prj-prod-dataplatform.dl_customers_db_raw.tdbk_customer_mtb
+        where created_dt <= '2024-05-06' and cust_id is not null 
+        ) ,
+    open_TSA_cust --- TSA customer which was opened before the cut off date and closed date is either null or greater than cutoff date
+    AS(
+        SELECT count (distinct OFCUSTOMERID) Total_open_TSA_customers from `core_raw.customer_accounts` 
+            where CRINTERDESC like 'Transactional Savings Account Inv_R'
+            and OFCUSTOMERID in (select distinct cust_id 
+            from prj-prod-dataplatform.dl_customers_db_raw.tdbk_customer_mtb where cust_id is not null)
+            AND OFDATEOPENED <= '2024-05-06'
+            AND (OFDATECLOSED = DATE('1970-01-01') OR  OFDATECLOSED > '2024-05-06')
+            )           
+            ,
+    loan_cust --list of customers having loan either in status Normal or Arrears at the cut off date
+    AS (
+        SELECT 
+            distinct CAST(lmt.customerId AS STRING) customerId
+        FROM 
+            `prj-prod-dataplatform.risk_credit_mis.loan_master_table` lmt
+            inner join prj-prod-dataplatform.risk_credit_mis.loan_bucket_flow_report_core lbfrc on lbfrc.loanAccountNumber = lmt.loanAccountNumber
+        WHERE lbfrc.bucketDate = date_sub(date('2024-05-06'), interval 1 day)  --- need to change the date
+        and lbfrc.loanStatus IN ('Normal', 'In Arrears')
+            )           
+            ,
+    ACL_Customer ---- ACL customer are TSBL loans with sub product type FP and disbursement date <= cutoff date
+        as 
+            (select lmt.customerId FROM `prj-prod-dataplatform.dl_loans_db_raw.tdbk_digital_loan_application` a
+                inner join `risk_credit_mis.loan_master_table` lmt on lmt.digitalLoanAccountId = a.digitalLoanAccountId
+                where coalesce(a.loanType, 'NA') = 'TSBL'and coalesce(a.loan_sub_product_type, 'NA') = 'FP'
+                and date_trunc(a.loanDigitalAppliedDateAndTime, day) <= '2024-05-06'
+                and date_trunc(lmt.disbursementDateTime, day) <= '2024-05-06' --- need to change the date
+                ),
+    non_ACL_cust --list of all customers who have no ACL loans (loatype TSBL and sub-product type FP)
+    AS (
+        SELECT 
+            distinct CAST(cust_id AS STRING) customerId
+        FROM 
+            `prj-prod-dataplatform.dl_customers_db_raw.tdbk_customer_mtb`
+        WHERE 
+            cast(cust_id as string) not in (select customerId from loan_cust)
+            and created_dt <= '2024-05-06' and cust_id is not null 
+    )
+    /*So, new definition of MAU is. Customer with open TSA and at least one any transaction for the amount greater than 100 PHP in the last 30 days. 
+    No active loan. OR has balance of the TSA + any Stash greater than 100 PHP. Whoch means if he didnt transact but he has money on TSA - he is MAU. 
+    If he doesnt transact and doesnt have money on TSA but has more than 100 PHP on Stash - he is active */
+    ,        
+    MAU_with_trx 
+    AS (
+        SELECT DISTINCT customer_id 
+        FROM `prj-prod-dataplatform.risk_mart.customer_transactions`
+        WHERE transaction_date BETWEEN DATE_SUB(date('2024-05-06'), INTERVAL 30 DAY) AND date('2024-05-06')
+        AND ABS(trx_amount) > 100  --- transaction greater than 100
+        AND account_type = "Tonik Account"  -- TSA account type
+        AND customer_id NOT IN (SELECT customerId FROM loan_cust)  --- no active loan
+        )
+        ,
+    MAU_with_bal 
+     AS (
+        SELECT 
+            DISTINCT client_id 
+        FROM 
+            `prj-prod-dataplatform.risk_mart.customer_balance`
+        WHERE
+            clearedbalance > 100  --- balance in any account greater than 100
+            AND account_type IN ("Tonik Account","Group Stash","Individual Stash")  ---- TSA, Group Stash and Individual Stash
+            AND balanceDateAsOf between date_sub(date('2024-05-06'), interval 30 day) and date('2024-05-06') ---- in last 30 days
+            AND client_id NOT IN (SELECT customerId FROM loan_cust) 
+        )            ,
+    MAU --- 
+        AS (
+        SELECT COUNT(distinct customer_id) AS MAU 
+        FROM 
+            (SELECT customer_id 
+            FROM 
+                MAU_with_trx
+            UNION DISTINCT
+            SELECT 
+                client_id AS customer_id
+            FROM 
+                MAU_with_bal)),
+    /* a) MMAU should be without active SIL, Quck and Flex loan. but when they will have ACL TSA loan - those should be included into MMAUs. 
+    b)  I would like to ask you to add  
+    1) the active TSA ACL loans issued (today its zero) after the MMAU.  
+    2) Difference between MMAU with TSA aCL loan and TSA ACL LOans that will show us the current pool of eligible customers. 
+    3) Offers extended. They should live somewhere on the datalake table. 
+    For example this week we will issue 1000 offers. Next week we will issue 10 000 more. So netx week it will be 11 k offers sent.   
+    And last one 4) Uptake. TSA ACL Loans active divided into Offers sent. as %.   */
+    MMAU_customerbase as (select cast(customerId as string)customerId from non_ACL_cust union all (select cast(customerId as string)customerId from ACL_Customer)) , 
+    transactional_cust --Mareks criteria
+    AS (
+        SELECT 
+            DISTINCT customer_id
+        FROM 
+            `prj-prod-dataplatform.risk_mart.customer_transactions`
+        WHERE
+            transaction_date BETWEEN DATE_SUB(date('2024-05-06'), INTERVAL 3 MONTH) AND date('2024-05-06')
+            AND customer_id in (SELECT customerId FROM MMAU_customerbase)
+        GROUP BY
+            customer_id
+        HAVING 
+            COUNT(*) >= 5
+    ),
+    cust_with_balance --Mareks criteria
+    AS (
+        SELECT 
+            DISTINCT client_id AS customer_id 
+        FROM 
+            `prj-prod-dataplatform.risk_mart.customer_balance`
+        WHERE
+            clearedbalance > 1000
+            AND account_type IN ("Tonik Account","Group Stash","Individual Stash")
+            AND balanceDateAsOf between date_sub(date('2024-05-06'), interval 30 day) and date('2024-05-06')
+            AND client_id in (SELECT customerId FROM MMAU_customerbase)
+            ),
+      MMAU
+    AS (
+        SELECT 
+            COUNT(customer_id) AS MMAU 
+        FROM 
+            ( SELECT 
+            customer_id 
+        FROM 
+            transactional_cust
+        UNION DISTINCT
+        SELECT 
+            customer_id
+        FROM 
+            cust_with_balance))
+          ,
+    ACL_customers 
+    AS (
+        SELECT 
+      count(distinct lmt.customerId ) ACL_customers
+        FROM 
+            `prj-prod-dataplatform.risk_credit_mis.loan_master_table` lmt
+        inner join ACL_Customer ac on ac.customerId = lmt.customerId
+        WHERE 
+           date(lmt.disbursementDateTime) between date_sub(date('2024-05-06'), interval 7 day) and date('2024-05-06')),
+    Offers_extended 
+    AS (
+        SELECT count(distinct cust_id) Offers_extended
+    FROM 
+    `prj-prod-dataplatform.dl_loans_db_raw.tdbk_loan_offers_trx` 
+    where date(offer_start_date) <= date('2024-05-06') 
+    )
+    ,
+    b
+    AS (
+        SELECT 
+            '{date}' AS Date,
+            *
+        FROM 
+            all_cust  
+        CROSS JOIN 
+            open_TSA_cust
+        CROSS JOIN 
+            MAU 
+        CROSS JOIN 
+            MMAU
+        CROSS JOIN
+            ACL_customers
+        CROSS JOIN 
+            Offers_extended)
+    select Date,
+            Total_registered_users,
+            Total_open_TSA_customers,
+            MAU,
+            MMAU,
+            ACL_customers,
+            MMAU - ACL_customers  MMAU_ACL_difference, 
+            Offers_extended,
+            CASE 
+                WHEN Offers_extended<> 0 then ACL_customers/Offers_extended 
+                ELSE NULL END AS Uptake
+            
+            from b;
